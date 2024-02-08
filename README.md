@@ -2,7 +2,7 @@
 
 ## Description 
 
-This CloudFormation template deploys a Squid proxy instance in each AZ within a VPC. It automatically routes traffic from the private subnets to the Elastic Network Interface (ENI) of the respective Squid proxy. The Squid proxies are managed within an Auto Scaling Group, and CloudWatch Alarms monitor their health. If a Squid proxy becomes unavailable, the default route for the corresponding AZ is redirected to another healthy instance. Adjustments to the proxy whitelist can be made directly by updating the CloudFormation stack parameters.
+The CloudFormation template provided deploys Squid proxy instances across each Availability Zone (AZ) within a Virtual Private Cloud (VPC). This configuration creates a "transparent proxy" capable of restricting both HTTP and HTTPS outbound traffic to a specified set of internet domains, while maintaining complete transparency for instances within the private subnet. It is designed to automatically route traffic from the private subnets through the Elastic Network Interface (ENI) associated with the corresponding Squid proxy. The Squid proxies are maintained within an Auto Scaling Group, ensuring scalability and reliability, and their health is monitored by CloudWatch Alarms. If a Squid proxy becomes unavailable, the default network route for the affected AZ is automatically redirected to another operational instance. Furthermore, updates to the proxy whitelist can be easily made by modifying the CloudFormation stack parameters.
 
 ![squid-proxy drawio](https://github.com/PatrickZink/squid-proxy-filtering/assets/70896863/5d1c173a-3df9-4fad-8e60-c5ff40032959)
 
@@ -44,5 +44,9 @@ With CloudWatch Insights, SQL-like queries can be executed across all proxy logs
 ```fields @timestamp, @message filter @message like 'TCP_DENIED'```
 
 ![image](https://github.com/PatrickZink/squid-proxy-filtering/assets/70896863/b0899a24-97a0-4646-aaac-3f6f41824031)
+
+## Allowed Domain List update
+
+The Allowed Domain List is specified or modified during the deployment of the CloudFormation template. To update the Allowed Domain List, the CloudFormation stack needs to be updated with the new list provided as an input parameter. Subsequently, the Squid proxies will automatically update their configuration with the revised settings.
 
 
