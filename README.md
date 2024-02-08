@@ -23,12 +23,12 @@ Deploy the stack squid-proxy-filtering.yml using CloudFormation as a new stack. 
 
 For testing purposes, one can access websites from an EC2 instance within the private network to validate the whitelist functionality. Execute a request to a site that is on the whitelist to see it succeed, and contrast this with a request to a non-whitelisted site to observe the expected failure.
 
-```curl https://www.amazon.com``` - This should work as it's on the whitelist. 
+```curl https://www.amazon.com``` - This should work as it's on the allowed domain list. 
 
 ![image](https://github.com/PatrickZink/squid-proxy-filtering/assets/70896863/e71be4fd-f960-454b-995b-176213a362e6)
 
 
-```curl https://www.wikipedia.com``` - This should fail because it's not on the whitelist.
+```curl https://www.wikipedia.com``` - This should fail because it's not on the allowed domain list.
 
 ![image](https://github.com/PatrickZink/squid-proxy-filtering/assets/70896863/a45ea510-27e0-439b-8c9d-592a208161df)
 
