@@ -1,0 +1,868 @@
+# This template is based on the CF template from this article:
+# https://aws.amazon.com/de/blogs/security/how-to-add-dns-filtering-to-your-nat-instance-with-squid/
+# The original template has been extended to include the following features:
+# - The ability to utilize an existing VPC.
+# - Expansion to support up to 3 different Availability Zones (AZs).
+# - Update and patch logic via Eventbridge, which recreates and patches the proxy instances every night.
+# - Use of IMDSv2 instead of IMDSv1
+# Created 2024-01-29 - Patrick Zink.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This CloudFormation template deploys a Squid proxy instance in each AZ within a 
+  VPC. It automatically routes traffic from the private subnets to the 
+  Elastic Network Interface (ENI) of the respective Squid proxy. The Squid proxies are managed 
+  within an Auto Scaling Group, and CloudWatch Alarms monitor their health. If a Squid proxy becomes unavailable, 
+  the default route for the corresponding AZ is redirected to another healthy instance. 
+  Adjustments to the proxy whitelist can be made directly by updating the CloudFormation stack parameters.
+
+Parameters:
+
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: AMI ID pointer in AWS Systems Manager Parameter Store. Default value points to the
+      latest Amazon Linux 2 AMI ID.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: Instance type to use to launch the NAT instances.
+    AllowedValues:
+    - t3.nano
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - m4.large
+    - m4.xlarge
+    - m4.2xlarge
+    - m5.large
+    - m5.xlarge
+    - m5.2xlarge
+    - c4.large
+    - c4.xlarge
+    - c4.large
+    - c5.large
+    - c5.xlarge
+    - c5.large
+
+  WhitelistDomains:
+    Type: CommaDelimitedList
+    Default: .amazonaws.com
+    Description: List of whitelisted domains separated by a comma. Enter ".example.com" to
+      whitelist all the sub-domains of example.com. New Line for each Domain.
+
+  VpcId: 
+    Description: VPC ID Where the Proxy will be installed
+    Type: "AWS::EC2::VPC::Id"
+  
+  VpcCIDR:
+    Description: CIDR from the VPC. For the Security Group associated with the Proxy.
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^[.0-9]*\/([89]|[12][0-9]|3[0-2])$
+
+  PrivateRouteTablesA: 
+    Description: Provide the Route Table IDs from AZ-A with comma separated 
+    Type: "String"
+
+  PrivateRouteTablesB: 
+    Description: Provide the Route Table IDs from AZ-B with comma separated 
+    Type: "String"
+
+  PrivateRouteTablesC: 
+    Description: Provide the Route Table IDs from AZ-C with comma separated 
+    Type: "String"
+  
+  PublicSubnetA: 
+    Description: Public SubnetIDs from AZ-A where the proxy will be placed. Only 1 Subnet!
+    Type: "String"
+
+  PublicSubnetB: 
+    Description: Public SubnetIDs from AZ-B where the proxy will be placed. Only 1 Subnet!
+    Type: "String"
+
+  PublicSubnetC: 
+    Description: Public SubnetIDs from AZ-C where the proxy will be placed. Only 1 Subnet!
+    Type: "String"
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+
+    ParameterGroups:
+    - Label:
+        default: Instance Configuration
+      Parameters:
+      - AmiId
+      - InstanceType
+    - Label:
+        default: Proxy Configuration
+      Parameters:
+      - WhitelistDomains
+    - Label:
+        default: VPC / RouteTable / PublicSubnetID Parameter
+      Parameters:
+      - VpcId
+      - VpcCIDR
+      - PrivateRouteTablesA
+      - PrivateRouteTablesB
+      - PrivateRouteTablesC
+      - PublicSubnetA
+      - PublicSubnetB
+      - PublicSubnetC
+
+    ParameterLabels:
+      AmiId:
+        default: AMI ID
+      InstanceType:
+        default: NAT Instance Type
+      WhitelistDomains:
+        default: Allowed Domains
+
+Conditions:
+  PublicSubnetBCondition: !Not [!Equals [!Ref PublicSubnetB, '']]
+  PublicSubnetCCondition: !Not [!Equals [!Ref PublicSubnetC, '']]
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+
+  S3PutLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:DeleteObject
+            Resource: !Sub '${S3Bucket.Arn}*'
+
+  S3PutLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt S3PutLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import boto3
+
+          def handler(event, context):
+            try:
+              print(json.dumps(event))
+              client = boto3.client('s3')
+              content = event['ResourceProperties']['Content']
+              bucket = event['ResourceProperties']['Bucket']
+              key = event['ResourceProperties']['Key']
+              physicalid = 's3://%s/%s' % (bucket, key)
+              if event['RequestType'] == 'Delete':
+                client.delete_object(Bucket=bucket, Key=key)
+              else:
+                client.put_object(Bucket=bucket, Key=key, Body=content.encode())
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalid)
+
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+              raise(e)
+
+  WhitelistS3Object:
+    Type: Custom::S3Object
+    Properties:
+      ServiceToken: !GetAtt S3PutLambdaFunction.Arn
+      Bucket: !Ref S3Bucket
+      Key: whitelist.txt
+      Content: !Join [ "\n", !Ref WhitelistDomains ]
+
+  SquidConfS3Object:
+    Type: Custom::S3Object
+    Properties:
+      ServiceToken: !GetAtt S3PutLambdaFunction.Arn
+      Bucket: !Ref S3Bucket
+      Key: squid.conf
+      Content: |
+        visible_hostname squid
+        cache deny all
+
+        # Log format and rotation
+        logformat squid %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %ssl::>sni %Sh/%<a %mt
+        logfile_rotate 10
+        debug_options rotate=10
+
+        # Handle HTTP requests
+        http_port 3128
+        http_port 3129 intercept
+
+        # Handle HTTPS requests
+        https_port 3130 cert=/etc/squid/ssl/squid.pem ssl-bump intercept
+        acl SSL_port port 443
+        http_access allow SSL_port
+        acl step1 at_step SslBump1
+        acl step2 at_step SslBump2
+        acl step3 at_step SslBump3
+        ssl_bump peek step1 all
+
+        # Deny requests to proxy instance metadata
+        acl instance_metadata dst 169.254.169.254
+        http_access deny instance_metadata
+
+        # Filter HTTP requests based on the whitelist
+        acl allowed_http_sites dstdomain "/etc/squid/whitelist.txt"
+        http_access allow allowed_http_sites
+
+        # Filter HTTPS requests based on the whitelist
+        acl allowed_https_sites ssl::server_name "/etc/squid/whitelist.txt"
+        ssl_bump peek step2 allowed_https_sites
+        ssl_bump splice step3 allowed_https_sites
+        ssl_bump terminate step2 all
+        
+        http_access deny all
+
+  NATInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListObject
+            Resource: !Sub '${S3Bucket.Arn}*'
+          - Effect: Allow
+            Action:
+            - ec2:ModifyInstanceAttribute
+            Resource: '*'
+
+  NATInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref NATInstanceRole
+      Path: /
+
+  NATInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows HTTP and HTTPS from private instances to NAT instances
+      SecurityGroupIngress:
+      - CidrIp: !Ref VpcCIDR
+        FromPort: 80
+        ToPort: 80
+        IpProtocol: TCP
+      - CidrIp: !Ref VpcCIDR
+        FromPort: 443
+        ToPort: 443
+        IpProtocol: TCP
+      Tags:
+      - Key: Name
+        Value: !Sub 'NAT Instance SG - ${AWS::StackName}'
+      VpcId: !Ref VpcId
+
+  NATInstanceLC:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+    - WhitelistS3Object
+    - SquidConfS3Object
+    Properties:
+      IamInstanceProfile: !Ref NATInstanceProfile
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      AssociatePublicIpAddress: true   # Enable public IP assignment
+      MetadataOptions:
+        HttpTokens: required
+      SecurityGroups:
+      - !Ref NATInstanceSG
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            # Redirect the user-data output to the console logs
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+            # Apply the latest security patches
+            yum update -y --security
+
+            # Disable source / destination check. It cannot be disabled from the launch configuration
+            region=${AWS::Region}
+            TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            instanceid=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+            aws ec2 modify-instance-attribute --no-source-dest-check --instance-id $instanceid --region $region
+
+            # Install and start Squid
+            yum install -y squid
+            systemctl start squid || service squid start
+            iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
+            iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
+
+            # Create a SSL certificate for the SslBump Squid module
+            mkdir /etc/squid/ssl
+            cd /etc/squid/ssl
+            openssl genrsa -out squid.key 4096
+            openssl req -new -key squid.key -out squid.csr -subj "/C=XX/ST=XX/L=squid/O=squid/CN=squid"
+            openssl x509 -req -days 3650 -in squid.csr -signkey squid.key -out squid.crt
+            cat squid.key squid.crt >> squid.pem
+
+            # Refresh the Squid configuration files from S3
+            mkdir /etc/squid/old
+            cat > /etc/squid/squid-conf-refresh.sh << 'EOF'
+            cp /etc/squid/* /etc/squid/old/
+            aws s3 sync s3://${S3Bucket} /etc/squid
+            /usr/sbin/squid -k parse && /usr/sbin/squid -k reconfigure || (cp /etc/squid/old/* /etc/squid/; exit 1)
+            EOF
+            chmod +x /etc/squid/squid-conf-refresh.sh
+            /etc/squid/squid-conf-refresh.sh
+
+            # Schedule tasks
+            cat > ~/mycron << 'EOF'
+            * * * * * /etc/squid/squid-conf-refresh.sh
+            0 0 * * * sleep $(($RANDOM % 3600)); yum -y update --security
+            0 0 * * * /usr/sbin/squid -k rotate
+            EOF
+            crontab ~/mycron
+            rm ~/mycron
+
+            # Install and configure the CloudWatch Agent
+            rpm -Uvh https://amazoncloudwatch-agent-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+            {
+              "agent": {
+                "metrics_collection_interval": 10,
+                "omit_hostname": true
+              },
+              "metrics": {
+                "metrics_collected": {
+                  "procstat": [
+                    {
+                      "pid_file": "/var/run/squid.pid",
+                      "measurement": [
+                        "cpu_usage"
+                      ]
+                    }
+                  ]
+                },
+                "append_dimensions": {
+                  "AutoScalingGroupName": "${!aws:AutoScalingGroupName}"
+                },
+                "force_flush_interval": 5
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      {
+                        "file_path": "/var/log/squid/access.log*",
+                        "log_group_name": "/filtering-nat-instance/access.log",
+                        "log_stream_name": "{instance_id}",
+                        "timezone": "Local"
+                      },
+                      {
+                        "file_path": "/var/log/squid/cache.log*",
+                        "log_group_name": "/filtering-nat-instance/cache.log",
+                        "log_stream_name": "{instance_id}",
+                        "timezone": "Local"
+                      }
+                    ]
+                  }
+
+                }
+              }
+            }
+            EOF
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+            # CloudFormation signal
+            yum update -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NATInstanceASG1 --region ${AWS::Region}
+
+
+
+  NATInstanceASG1:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: 1
+      MinSize: 1
+      Tags:
+      - Key: Name
+        Value: !Sub 'NAT Instance 1 - ${AWS::StackName}'
+        PropagateAtLaunch: True
+      - Key: RouteTableIds
+        Value: !Ref PrivateRouteTablesA
+        PropagateAtLaunch: False
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetA
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+  NATInstanceASGHook1: 
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: 
+      AutoScalingGroupName: !Ref NATInstanceASG1
+      DefaultResult: ABANDON
+      LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+      HeartbeatTimeout: 300
+
+  NATInstanceASG2:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: 1
+      MinSize: 1
+      Tags:
+      - Key: Name
+        Value: !Sub 'NAT Instance 2 - ${AWS::StackName}'
+        PropagateAtLaunch: True
+      - Key: RouteTableIds
+        Value: !Ref PrivateRouteTablesB
+        PropagateAtLaunch: False
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetB
+    Condition: PublicSubnetBCondition
+
+  NATInstanceASGHook2: 
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: 
+      AutoScalingGroupName: !Ref NATInstanceASG2
+      DefaultResult: ABANDON
+      LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+      HeartbeatTimeout: 300
+    Condition: PublicSubnetBCondition
+
+  NATInstanceASG3:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      DesiredCapacity: 1
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref NATInstanceLC
+      MaxSize: 1
+      MinSize: 1
+      Tags:
+      - Key: Name
+        Value: !Sub 'NAT Instance 3 - ${AWS::StackName}'
+        PropagateAtLaunch: True
+      - Key: RouteTableIds
+        Value: !Ref PrivateRouteTablesC
+        PropagateAtLaunch: False
+      VPCZoneIdentifier:
+      - !Ref PublicSubnetC
+    Condition: PublicSubnetCCondition
+
+  NATInstanceASGHook3: 
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties: 
+      AutoScalingGroupName: !Ref NATInstanceASG3
+      DefaultResult: ABANDON
+      LifecycleTransition: autoscaling:EC2_INSTANCE_LAUNCHING
+      HeartbeatTimeout: 300
+    Condition: PublicSubnetCCondition
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties: 
+      Endpoint: !GetAtt AlarmLambdaFunction.Arn
+      Protocol: lambda
+      TopicArn: !Ref AlarmTopic
+
+  Alarm1:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Heart beat for NAT Instance 1'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG1}'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG1
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 10
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+
+  Alarm2:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Heart beat for NAT Instance 2'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG2}'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG2
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 10
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+    Condition: PublicSubnetBCondition
+
+  Alarm3:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Heart beat for NAT Instance 3'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG3}'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG3
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 10
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+    Condition: PublicSubnetCCondition
+
+  AlarmLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref AlarmLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmTopic
+
+  AlarmLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - autoscaling:Describe*
+            - autoscaling:CompleteLifecycleAction
+            - autoscaling:SetInstanceHealth
+            - cloudwatch:Describe*
+            - ec2:CreateRoute
+            - ec2:CreateTags
+            - ec2:ReplaceRoute
+            - ec2:Describe*
+            Resource: '*'
+
+  AlarmLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt AlarmLambdaRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+
+          as_client = boto3.client('autoscaling')
+          cw_client = boto3.client('cloudwatch')
+          ec2_client = boto3.client('ec2')
+
+          # Function to create or update the default route
+          def update_route(route_table_id, instance_id, asg_name):
+            parameters = {
+              'DestinationCidrBlock': '0.0.0.0/0',
+              'RouteTableId': route_table_id,
+              'InstanceId': instance_id
+            }
+            try:
+              ec2_client.replace_route(**parameters)
+            except:
+              ec2_client.create_route(**parameters)
+            ec2_client.create_tags(
+              Resources=[route_table_id],
+              Tags=[{'Key': 'AutoScalingGroupName', 'Value': asg_name}]
+            )
+            print('Updated default route of %s to %s' % (route_table_id, instance_id))
+
+          def handler(event, context):
+            print(json.dumps(event))
+            for record in event['Records']:
+              message = json.loads(record['Sns']['Message'])
+              print('Alarm state: %s' % message['NewStateValue'])
+
+              # Auto Scaling group associated to the alarm
+              asg_name = message['AlarmName'].split('/')[1]
+              print('ASG Name: %s' % asg_name)
+              asg = as_client.describe_auto_scaling_groups(
+                AutoScalingGroupNames=[asg_name]
+              )['AutoScalingGroups'][0]
+
+              # If the NAT instance has failed
+              if message['NewStateValue'] == 'ALARM':
+
+                # Set the NAT instance to Unhealthy
+                try:
+                  for instance in asg['Instances']:
+                    as_client.set_instance_health(
+                      InstanceId=instance['InstanceId'],
+                      HealthStatus='Unhealthy'
+                    )
+                    print('Set instance %s to Unhealthy' % instance['InstanceId'])
+                except:
+                  pass
+
+                # Route traffic to the first health NAT instance
+                for healthy_alarm in cw_client.describe_alarms(
+                  AlarmNamePrefix='${AWS::StackName}/',
+                  ActionPrefix='${AlarmTopic}',
+                  StateValue='OK'
+                )['MetricAlarms']:
+
+                  healthy_asg_name = healthy_alarm['AlarmName'].split('/')[1]
+                  healthy_asg = as_client.describe_auto_scaling_groups(
+                    AutoScalingGroupNames=[healthy_asg_name]
+                  )['AutoScalingGroups'][0]
+                  healthy_instance_id = healthy_asg['Instances'][0]['InstanceId']
+                  print('Healthy NAT instance: %s' % healthy_instance_id)
+
+                  # For each route table that currently routes traffic to the unhealthy NAT
+                  # instance, update the default route
+                  for route_table in ec2_client.describe_route_tables(
+                    Filters=[{'Name': 'tag:AutoScalingGroupName', 'Values': [asg_name]}]
+                  )['RouteTables']:
+                    update_route(route_table['RouteTableId'], healthy_instance_id, healthy_asg_name)
+
+                  break
+
+              # If the NAT instance has recovered
+              else:
+
+                # ID of the NAT instance launched by the Auto Scaling group
+                for instance in asg['Instances']:
+                  if instance['HealthStatus'] == 'Healthy':
+                    asg_instance_id = instance['InstanceId']
+                    break
+                print('Instance launched by the ASG: %s' % asg_instance_id)
+
+                # Complete the lifecycle action if the NAT instance was just launched
+                lc_name = as_client.describe_lifecycle_hooks(
+                  AutoScalingGroupName=asg_name
+                )['LifecycleHooks'][0]['LifecycleHookName']
+                try:
+                  as_client.complete_lifecycle_action(
+                    LifecycleHookName=lc_name,
+                    AutoScalingGroupName=asg_name,
+                    LifecycleActionResult='CONTINUE',
+                    InstanceId=asg_instance_id
+                  )
+                  print('Lifecycle action completed')
+                except:
+                  pass
+
+                # Create or update the default route for each route table that should route 
+                # traffic to this NAT instance in a nominal situation
+                for route_table_id in as_client.describe_tags(
+                  Filters=[
+                    {'Name': 'auto-scaling-group', 'Values': [asg_name]},
+                    {'Name': 'key', 'Values': ['RouteTableIds']}
+                  ]
+                )['Tags'][0]['Value'].split(','):
+                  update_route(route_table_id, asg_instance_id, asg_name)
+
+  RefreshInstancesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt RefreshInstancesRole.Arn
+      Code:
+        ZipFile: !Sub |
+            import json
+            import boto3
+
+            def handler(event, context):
+                if 'alarm_name' in event:
+                    alarm_name = event['alarm_name']
+                    cloudwatch_client = boto3.client('cloudwatch')
+                    cloudwatch_client.set_alarm_state(
+                        AlarmName=alarm_name,
+                        StateValue='ALARM',
+                        StateReason='Manuelle Aktualisierung durch Lambda-Funktion'
+                    )
+                    print(f'Alarm "{alarm_name}" auf "ALARM" gesetzt.')
+                else:
+                    print('Kein Alarmname im Event gefunden. Kein Alarm wurde aktualisiert.')
+
+  LambdaFunctionPermissionASG1:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName: !Ref RefreshInstancesFunction
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn: !GetAtt RefreshInstancesScheduleASG1.Arn 
+
+  LambdaFunctionPermissionASG2:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName: !Ref RefreshInstancesFunction
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn: !GetAtt RefreshInstancesScheduleASG2.Arn 
+      Condition: PublicSubnetBCondition
+
+  LambdaFunctionPermissionASG3:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+        FunctionName: !Ref RefreshInstancesFunction
+        Action: "lambda:InvokeFunction"
+        Principal: "events.amazonaws.com"
+        SourceArn: !GetAtt RefreshInstancesScheduleASG3.Arn 
+      Condition: PublicSubnetCCondition
+
+  RefreshInstancesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: Set-Alarm
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:SetAlarmState
+                Resource: '*'
+
+
+  RefreshInstancesScheduleASG1:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'Refresh-${NATInstanceASG1}'
+      ScheduleExpression: cron(0 0 * * ? *)  # Run at 0:00 AM UTC every day
+      State: ENABLED
+      EventBusName: default
+      Description: Set Alarm for initiating instance refresh for NATInstanceASG1
+      Targets:
+        - Arn: !GetAtt RefreshInstancesFunction.Arn
+          Id: StartInstanceRefresh
+          Input: !Sub '{"alarm_name": "${Alarm1}"}'  
+
+  RefreshInstancesScheduleASG2:
+    Type: AWS::Events::Rule
+    Condition: PublicSubnetBCondition
+    Properties:
+      Name: !Sub 'Refresh-${NATInstanceASG2}'
+      ScheduleExpression: cron(10 0 * * ? *)  # Run at 0:10 AM UTC every day
+      State: ENABLED
+      EventBusName: default
+      Description: Set Alarm for initiating instance refresh for NATInstanceASG2
+      Targets:
+        - Arn: !GetAtt RefreshInstancesFunction.Arn
+          Id: StartInstanceRefresh
+          Input: !Sub '{"alarm_name": "${Alarm2}"}'   
+
+  RefreshInstancesScheduleASG3:
+    Type: AWS::Events::Rule
+    Condition: PublicSubnetCCondition
+    Properties:
+      Name: !Sub 'Refresh-${NATInstanceASG3}'
+      ScheduleExpression: cron(20 0 * * ? *)  # Run at 0:20 AM UTC every day
+      State: ENABLED
+      EventBusName: default
+      Description: Set Alarm for initiating instance refresh for NATInstanceASG3
+      Targets:
+        - Arn: !GetAtt RefreshInstancesFunction.Arn
+          Id: StartInstanceRefresh
+          Input: !Sub '{"alarm_name": "${Alarm3}"}'
