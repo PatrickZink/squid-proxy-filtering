@@ -56,7 +56,7 @@ Parameters:
   VpcId: 
     Description: VPC ID Where the Proxy will be installed
     Type: "AWS::EC2::VPC::Id"
-  
+
   VpcCIDR:
     Description: CIDR from the VPC. For the Security Group associated with the Proxy.
     Type: String
@@ -74,7 +74,7 @@ Parameters:
   PrivateRouteTablesC: 
     Description: Provide the Route Table IDs from AZ-C with comma separated 
     Type: "String"
-  
+
   PublicSubnetA: 
     Description: Public SubnetIDs from AZ-A where the proxy will be placed. Only 1 Subnet!
     Type: "String"
@@ -167,7 +167,6 @@ Resources:
           import json
           import cfnresponse
           import boto3
-
           def handler(event, context):
             try:
               print(json.dumps(event))
@@ -181,11 +180,9 @@ Resources:
               else:
                 client.put_object(Bucket=bucket, Key=key, Body=content.encode())
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalid)
-
             except Exception as e:
               cfnresponse.send(event, context, cfnresponse.FAILED, {})
               raise(e)
-
   WhitelistS3Object:
     Type: Custom::S3Object
     Properties:
@@ -203,16 +200,13 @@ Resources:
       Content: |
         visible_hostname squid
         cache deny all
-
         # Log format and rotation
         logformat squid %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %ssl::>sni %Sh/%<a %mt
         logfile_rotate 10
         debug_options rotate=10
-
         # Handle HTTP requests
         http_port 3128
         http_port 3129 intercept
-
         # Handle HTTPS requests
         https_port 3130 cert=/etc/squid/ssl/squid.pem ssl-bump intercept
         acl SSL_port port 443
@@ -221,15 +215,12 @@ Resources:
         acl step2 at_step SslBump2
         acl step3 at_step SslBump3
         ssl_bump peek step1 all
-
         # Deny requests to proxy instance metadata
         acl instance_metadata dst 169.254.169.254
         http_access deny instance_metadata
-
         # Filter HTTP requests based on the whitelist
         acl allowed_http_sites dstdomain "/etc/squid/whitelist.txt"
         http_access allow allowed_http_sites
-
         # Filter HTTPS requests based on the whitelist
         acl allowed_https_sites ssl::server_name "/etc/squid/whitelist.txt"
         ssl_bump peek step2 allowed_https_sites
@@ -237,7 +228,6 @@ Resources:
         ssl_bump terminate step2 all
         
         http_access deny all
-
   NATInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -639,11 +629,9 @@ Resources:
         ZipFile: !Sub |
           import json
           import boto3
-
           as_client = boto3.client('autoscaling')
           cw_client = boto3.client('cloudwatch')
           ec2_client = boto3.client('ec2')
-
           # Function to create or update the default route
           def update_route(route_table_id, instance_id, asg_name):
             parameters = {
@@ -660,23 +648,19 @@ Resources:
               Tags=[{'Key': 'AutoScalingGroupName', 'Value': asg_name}]
             )
             print('Updated default route of %s to %s' % (route_table_id, instance_id))
-
           def handler(event, context):
             print(json.dumps(event))
             for record in event['Records']:
               message = json.loads(record['Sns']['Message'])
               print('Alarm state: %s' % message['NewStateValue'])
-
               # Auto Scaling group associated to the alarm
               asg_name = message['AlarmName'].split('/')[1]
               print('ASG Name: %s' % asg_name)
               asg = as_client.describe_auto_scaling_groups(
                 AutoScalingGroupNames=[asg_name]
               )['AutoScalingGroups'][0]
-
               # If the NAT instance has failed
               if message['NewStateValue'] == 'ALARM':
-
                 # Set the NAT instance to Unhealthy
                 try:
                   for instance in asg['Instances']:
@@ -687,40 +671,33 @@ Resources:
                     print('Set instance %s to Unhealthy' % instance['InstanceId'])
                 except:
                   pass
-
                 # Route traffic to the first health NAT instance
                 for healthy_alarm in cw_client.describe_alarms(
                   AlarmNamePrefix='${AWS::StackName}/',
                   ActionPrefix='${AlarmTopic}',
                   StateValue='OK'
                 )['MetricAlarms']:
-
                   healthy_asg_name = healthy_alarm['AlarmName'].split('/')[1]
                   healthy_asg = as_client.describe_auto_scaling_groups(
                     AutoScalingGroupNames=[healthy_asg_name]
                   )['AutoScalingGroups'][0]
                   healthy_instance_id = healthy_asg['Instances'][0]['InstanceId']
                   print('Healthy NAT instance: %s' % healthy_instance_id)
-
                   # For each route table that currently routes traffic to the unhealthy NAT
                   # instance, update the default route
                   for route_table in ec2_client.describe_route_tables(
                     Filters=[{'Name': 'tag:AutoScalingGroupName', 'Values': [asg_name]}]
                   )['RouteTables']:
                     update_route(route_table['RouteTableId'], healthy_instance_id, healthy_asg_name)
-
                   break
-
               # If the NAT instance has recovered
               else:
-
                 # ID of the NAT instance launched by the Auto Scaling group
                 for instance in asg['Instances']:
                   if instance['HealthStatus'] == 'Healthy':
                     asg_instance_id = instance['InstanceId']
                     break
                 print('Instance launched by the ASG: %s' % asg_instance_id)
-
                 # Complete the lifecycle action if the NAT instance was just launched
                 lc_name = as_client.describe_lifecycle_hooks(
                   AutoScalingGroupName=asg_name
@@ -735,7 +712,6 @@ Resources:
                   print('Lifecycle action completed')
                 except:
                   pass
-
                 # Create or update the default route for each route table that should route 
                 # traffic to this NAT instance in a nominal situation
                 for route_table_id in as_client.describe_tags(
@@ -745,19 +721,17 @@ Resources:
                   ]
                 )['Tags'][0]['Value'].split(','):
                   update_route(route_table_id, asg_instance_id, asg_name)
-
   RefreshInstancesFunction:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.handler
-      : python3.7
+      Runtime: python3.12
       Timeout: 30
       Role: !GetAtt RefreshInstancesRole.Arn
       Code:
         ZipFile: !Sub |
             import json
             import boto3
-
             def handler(event, context):
                 if 'alarm_name' in event:
                     alarm_name = event['alarm_name']
@@ -770,7 +744,6 @@ Resources:
                     print(f'Alarm "{alarm_name}" auf "ALARM" gesetzt.')
                 else:
                     print('Kein Alarmname im Event gefunden. Kein Alarm wurde aktualisiert.')
-
   LambdaFunctionPermissionASG1:
       Type: "AWS::Lambda::Permission"
       Properties:
