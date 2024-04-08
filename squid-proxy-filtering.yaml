@@ -159,7 +159,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.handler
-      Runtime: python3.7
+      Runtime: python3.12
       Timeout: 30
       Role: !GetAtt S3PutLambdaRole.Arn
       Code:
@@ -632,7 +632,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.handler
-      Runtime: python3.7
+      Runtime: python3.12
       Timeout: 30
       Role: !GetAtt AlarmLambdaRole.Arn
       Code:
@@ -750,7 +750,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.handler
-      Runtime: python3.7
+      : python3.7
       Timeout: 30
       Role: !GetAtt RefreshInstancesRole.Arn
       Code:
