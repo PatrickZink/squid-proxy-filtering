@@ -802,7 +802,7 @@ Resources:
   RefreshInstancesScheduleASG1:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'Refresh-${NATInstanceASG1}'
+      Name: 'Refresh-NATInstanceASG1'
       ScheduleExpression: cron(0 0 * * ? *)  # Run at 0:00 AM UTC every day
       State: ENABLED
       EventBusName: default
@@ -816,7 +816,7 @@ Resources:
     Type: AWS::Events::Rule
     Condition: PublicSubnetBCondition
     Properties:
-      Name: !Sub 'Refresh-${NATInstanceASG2}'
+      Name: 'Refresh-NATInstanceASG2'
       ScheduleExpression: cron(10 0 * * ? *)  # Run at 0:10 AM UTC every day
       State: ENABLED
       EventBusName: default
@@ -830,7 +830,7 @@ Resources:
     Type: AWS::Events::Rule
     Condition: PublicSubnetCCondition
     Properties:
-      Name: !Sub 'Refresh-${NATInstanceASG3}'
+      Name: 'Refresh-NATInstanceASG3'
       ScheduleExpression: cron(20 0 * * ? *)  # Run at 0:20 AM UTC every day
       State: ENABLED
       EventBusName: default
