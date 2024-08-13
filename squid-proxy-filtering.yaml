@@ -4,8 +4,11 @@
 # - The ability to utilize an existing VPC.
 # - Expansion to support up to 3 different Availability Zones (AZs).
 # - Update and patch logic via Eventbridge, which recreates and patches the proxy instances every night.
-# - Use of IMDSv2 instead of IMDSv1
-# Created 2024-01-29 - Patrick Zink.
+# - IMDSv2 instead of IMDSv1
+# - AWS::EC2::LaunchTemplate instead of AWS::AutoScaling::LaunchConfiguration
+# - GP3 EBS Volumens 
+# - Encrypted EBS Volumens
+# Last Update 2024-08-13 - Patrick Zink
 
 AWSTemplateFormatVersion: '2010-09-09'
 
@@ -284,23 +287,27 @@ Resources:
         Value: !Sub 'NAT Instance SG - ${AWS::StackName}'
       VpcId: !Ref VpcId
 
-  NATInstanceLC:
-    Type: AWS::AutoScaling::LaunchConfiguration
+  NATInstanceLT:
+    Type: AWS::EC2::LaunchTemplate
     DependsOn:
     - WhitelistS3Object
     - SquidConfS3Object
     Properties:
-      IamInstanceProfile: !Ref NATInstanceProfile
-      InstanceType: !Ref InstanceType
-      ImageId: !Ref AmiId
-      AssociatePublicIpAddress: true   # Enable public IP assignment
-      MetadataOptions:
-        HttpTokens: required
-      SecurityGroups:
-      - !Ref NATInstanceSG
-      UserData:
-        Fn::Base64:
-          !Sub |
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt NATInstanceProfile.Arn
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref AmiId
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref NATInstanceSG
+        MetadataOptions:
+          HttpTokens: required
+        UserData:
+          Fn::Base64:
+            !Sub |
             #!/bin/bash -xe
             # Redirect the user-data output to the console logs
             exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
@@ -400,15 +407,23 @@ Resources:
             yum update -y aws-cfn-bootstrap
             /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NATInstanceASG1 --region ${AWS::Region}
 
-
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
 
   NATInstanceASG1:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NATInstanceLT
     Properties:
       DesiredCapacity: 1
       HealthCheckGracePeriod: 300
       HealthCheckType: EC2
-      LaunchConfigurationName: !Ref NATInstanceLC
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NATInstanceLT
+        Version: !GetAtt NATInstanceLT.LatestVersionNumber
       MaxSize: 1
       MinSize: 1
       Tags:
@@ -435,11 +450,14 @@ Resources:
 
   NATInstanceASG2:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NATInstanceLT
     Properties:
       DesiredCapacity: 1
       HealthCheckGracePeriod: 300
       HealthCheckType: EC2
-      LaunchConfigurationName: !Ref NATInstanceLC
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NATInstanceLT
+        Version: !GetAtt NATInstanceLT.LatestVersionNumber
       MaxSize: 1
       MinSize: 1
       Tags:
@@ -464,11 +482,14 @@ Resources:
 
   NATInstanceASG3:
     Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NATInstanceLT
     Properties:
       DesiredCapacity: 1
       HealthCheckGracePeriod: 300
       HealthCheckType: EC2
-      LaunchConfigurationName: !Ref NATInstanceLC
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NATInstanceLT
+        Version: !GetAtt NATInstanceLT.LatestVersionNumber
       MaxSize: 1
       MinSize: 1
       Tags:
