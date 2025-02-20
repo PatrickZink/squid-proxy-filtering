@@ -8,7 +8,8 @@
 # - AWS::EC2::LaunchTemplate instead of AWS::AutoScaling::LaunchConfiguration
 # - GP3 EBS Volumens 
 # - Encrypted EBS Volumens
-# Last Update 2024-08-13 - Patrick Zink
+# - Change Image from Amazon Linux2 to Amazon Linux 2023 
+# Last Update 2025-02-19 - Patrick Zink
 
 AWSTemplateFormatVersion: '2010-09-09'
 
@@ -23,7 +24,7 @@ Parameters:
 
   AmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
-    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
     Description: AMI ID pointer in AWS Systems Manager Parameter Store. Default value points to the
       latest Amazon Linux 2 AMI ID.
 
@@ -204,7 +205,8 @@ Resources:
         visible_hostname squid
         cache deny all
         # Log format and rotation
-        logformat squid %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %ssl::>sni %Sh/%<a %mt
+        logformat customformat %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %ssl::>sni %>rd %Sh/%<a %mt
+        access_log /var/log/squid/access.log customformat
         logfile_rotate 10
         debug_options rotate=10
         # Handle HTTP requests
@@ -321,9 +323,20 @@ Resources:
             instanceid=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
             aws ec2 modify-instance-attribute --no-source-dest-check --instance-id $instanceid --region $region
 
+            #Install iptables and cron
+            yum install cronie -y
+            systemctl enable crond.service
+            systemctl start crond.service
+
+            yum install iptables-services -y
+            systemctl enable iptables
+            systemctl start iptables
+
+
             # Install and start Squid
             yum install -y squid
-            systemctl start squid || service squid start
+            systemctl enable squid
+            iptables -F
             iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 3129
             iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 3130
 
@@ -334,6 +347,14 @@ Resources:
             openssl req -new -key squid.key -out squid.csr -subj "/C=XX/ST=XX/L=squid/O=squid/CN=squid"
             openssl x509 -req -days 3650 -in squid.csr -signkey squid.key -out squid.crt
             cat squid.key squid.crt >> squid.pem
+
+            # Initialize the SSL certificates database
+            /usr/lib64/squid/security_file_certgen -c -s /var/spool/squid/ssl_db -M 4MB
+            chown -R squid:squid /var/spool/squid/ssl_db
+            chmod -R 750 /var/spool/squid/ssl_db
+
+            # Start Squid service
+            systemctl start squid
 
             # Refresh the Squid configuration files from S3
             mkdir /etc/squid/old
