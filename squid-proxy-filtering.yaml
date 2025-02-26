@@ -9,7 +9,7 @@
 # - GP3 EBS Volumens 
 # - Encrypted EBS Volumens
 # - Change Image from Amazon Linux2 to Amazon Linux 2023 
-# Last Update 2025-02-19 - Patrick Zink
+# Last Update 2025-02-26 - Patrick Zink
 
 AWSTemplateFormatVersion: '2010-09-09'
 
@@ -369,14 +369,28 @@ Resources:
             # Schedule tasks
             cat > ~/mycron << 'EOF'
             * * * * * /etc/squid/squid-conf-refresh.sh
-            0 0 * * * sleep $(($RANDOM % 3600)); yum -y update --security
-            0 0 * * * /usr/sbin/squid -k rotate
             EOF
             crontab ~/mycron
             rm ~/mycron
 
-            # Install and configure the CloudWatch Agent
-            rpm -Uvh https://amazoncloudwatch-agent-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+            # Retry logic for installing the CloudWatch Agent with a maximum of 5 attempts
+            retry=0
+            max_retries=5
+            while [ $retry -lt $max_retries ]; do
+                if rpm -Uvh https://amazoncloudwatch-agent-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm; then
+                    break
+                else
+                    retry=$((retry+1))
+                    echo "Retry $retry/$max_retries"
+                    sleep 10
+                fi
+            done
+
+            if [ $retry -eq $max_retries ]; then
+                echo "Failed to install CloudWatch Agent after $max_retries attempts"
+                exit 1
+            fi
+
             cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
             {
               "agent": {
@@ -615,6 +629,83 @@ Resources:
       OKActions: 
       - !Ref AlarmTopic
       Period: 10
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+    Condition: PublicSubnetCCondition
+
+  Alarm1Repeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Repeat alarm for NAT Instance 1 if still ALARM after 1 hour'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG1}/Repeat'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG1
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 3600
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+
+  Alarm2Repeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Repeat alarm for NAT Instance 2 if still ALARM after 1 hour'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG2}/Repeat'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG2
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 3600
+      Statistic: Average
+      Threshold: 0.0
+      TreatMissingData: breaching
+    Condition: PublicSubnetBCondition
+
+  Alarm3Repeat:
+    Type: AWS::CloudWatch::Alarm
+    Properties: 
+      AlarmActions: 
+      - !Ref AlarmTopic
+      AlarmDescription: !Sub 'Repeat alarm for NAT Instance 3 if still ALARM after 1 hour'
+      AlarmName: !Sub '${AWS::StackName}/${NATInstanceASG3}/Repeat'
+      ComparisonOperator: LessThanThreshold
+      Dimensions: 
+      - Name: AutoScalingGroupName
+        Value: !Ref NATInstanceASG3
+      - Name: pidfile
+        Value: /var/run/squid.pid
+      - Name: process_name
+        Value: squid
+      EvaluationPeriods: 1
+      MetricName: procstat_cpu_usage
+      Namespace: CWAgent
+      OKActions: 
+      - !Ref AlarmTopic
+      Period: 3600
       Statistic: Average
       Threshold: 0.0
       TreatMissingData: breaching
